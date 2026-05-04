@@ -13,6 +13,10 @@ CHANNELS = 1
 MIN_RMS = 0.01
 MIN_FREQ = 70.0
 MAX_FREQ = 1200.0
+PITCH_HISTORY_SIZE = 5
+PITCH_STABLE_SPREAD = 25.0
+NOTE_HIT_CENTS = 50.0
+NOTE_POINTS = 100
 
 
 class NoteEvent:
@@ -142,6 +146,116 @@ def format_note_event(event):
     return result
 
 
+def cents_difference(actual_frequency, target_frequency):
+    if actual_frequency <= 0.0 or target_frequency <= 0.0:
+        return 0.0
+    return 1200.0 * math.log(actual_frequency / target_frequency, 2.0)
+
+
+def note_name(note_number):
+    note_names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+    name = note_names[note_number % 12]
+    octave = (note_number // 12) - 1
+    return f"{name}{octave}"
+
+
+class PitchTracker:
+    def __init__(self):
+        self.history = []
+
+    def update(self, frequency_hz):
+        if frequency_hz > 0.0:
+            self.history.append(frequency_hz)
+
+        while len(self.history) > PITCH_HISTORY_SIZE:
+            self.history.pop(0)
+
+        valid = []
+        for value in self.history:
+            if value > 0.0:
+                valid.append(value)
+
+        if len(valid) < 3:
+            return 0.0, 0.0
+
+        sorted_valid = sorted(valid)
+        middle = len(sorted_valid) // 2
+        if len(sorted_valid) % 2 == 1:
+            stable_frequency = sorted_valid[middle]
+        else:
+            stable_frequency = (sorted_valid[middle - 1] + sorted_valid[middle]) / 2.0
+
+        spread = sorted_valid[-1] - sorted_valid[0]
+        confidence = 1.0 - min(spread / PITCH_STABLE_SPREAD, 1.0)
+        return stable_frequency, confidence
+
+
+class ScoreState:
+    def __init__(self):
+        self.score = 0
+        self.hits = 0
+        self.misses = 0
+        self.combo = 0
+        self.scored_note = None
+        self.missed_note = None
+
+    def reset_note_state(self, note_number):
+        if self.scored_note != note_number:
+            self.scored_note = None
+        if self.missed_note != note_number:
+            self.missed_note = None
+
+    def award_hit(self, target_note, detected_frequency, cents_off, confidence):
+        if target_note is None:
+            return False
+
+        if self.scored_note == target_note.note:
+            return False
+
+        if abs(cents_off) > NOTE_HIT_CENTS:
+            return False
+
+        points = NOTE_POINTS
+        points = points + int(max(0.0, 1.0 - abs(cents_off) / NOTE_HIT_CENTS) * 25.0)
+        points = points + int(confidence * 10.0)
+        points = points + (self.combo * 5)
+
+        self.score += points
+        self.hits += 1
+        self.combo += 1
+        self.scored_note = target_note.note
+        self.missed_note = None
+        return True
+
+    def mark_miss(self, target_note):
+        if target_note is None:
+            return False
+
+        if self.scored_note == target_note.note:
+            return False
+
+        if self.missed_note == target_note.note:
+            return False
+
+        self.misses += 1
+        self.combo = 0
+        self.missed_note = target_note.note
+        return True
+
+
+def find_notes_for_time(song, elapsed_seconds):
+    active_note = None
+    upcoming_note = None
+    for event in song.note_events:
+        if event.start_time <= elapsed_seconds < event.end_time:
+            active_note = event
+            break
+        if event.start_time > elapsed_seconds:
+            upcoming_note = event
+            break
+    return active_note, upcoming_note
+
+
 def detect_major_frequency(data):
     # keep noise from triggering random peaks
     rms = math.sqrt(np.mean(data * data))
@@ -203,11 +317,15 @@ def choose_input_device(default_device=None):
     return selected_device
 
 
-def listen_for_frequency(input_device=None):
+def listen_for_frequency(song, input_device=None):
     import sounddevice as sd
 
     selected_device = choose_input_device(input_device)
     last_print_time = [0.0]
+    pitch_tracker = PitchTracker()
+    score_state = ScoreState()
+    start_time = time.time()
+    last_seen_target_note = [None]
 
     # audio callback to save data
     def audio_callback(indata, frames, time_info, status):
@@ -216,13 +334,53 @@ def listen_for_frequency(input_device=None):
 
         data = indata[:, 0]  # mono
         freq, rms = detect_major_frequency(data)
+        stable_freq, confidence = pitch_tracker.update(freq)
 
         now = time.time()
+        elapsed = now - start_time
+        active_note, upcoming_note = find_notes_for_time(song, elapsed)
+
+        if active_note is not None:
+            score_state.reset_note_state(active_note.note)
+
+            if last_seen_target_note[0] != active_note.note:
+                last_seen_target_note[0] = active_note.note
+
+            if stable_freq > 0.0:
+                cents_off = cents_difference(stable_freq, active_note.frequency_hz)
+                score_state.award_hit(active_note, stable_freq, cents_off, confidence)
+
+            if elapsed >= active_note.end_time and score_state.scored_note != active_note.note:
+                score_state.mark_miss(active_note)
+
         if now - last_print_time[0] >= 0.1:
-            if freq > 0.0:
-                print(f"\rDetected frequency: {freq:7.2f} Hz  RMS: {rms:0.4f}", end="", flush=True)
+            display_note = active_note
+            if display_note is None:
+                display_note = upcoming_note
+
+            if display_note is None:
+                target_text = "Target: ---"
             else:
-                print("\rDetected frequency:   ---    Hz  RMS too low", end="", flush=True)
+                target_text = f"Target: {note_name(display_note.note)} {display_note.frequency_hz:7.2f} Hz"
+
+            if stable_freq > 0.0 and active_note is not None:
+                cents_off = 0.0
+                cents_off = cents_difference(stable_freq, active_note.frequency_hz)
+                print(
+                    f"\rDetected frequency: {stable_freq:7.2f} Hz  "
+                    f"RMS: {rms:0.4f}  Confidence: {confidence:0.2f}  "
+                    f"{target_text}  Score: {score_state.score}  Combo: {score_state.combo}  "
+                    f"Hits: {score_state.hits}  Misses: {score_state.misses}  Cents: {cents_off:0.1f}",
+                    end="",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"\rDetected frequency:   ---    Hz  RMS too low  {target_text}  "
+                    f"Score: {score_state.score}  Combo: {score_state.combo}  Hits: {score_state.hits}  Misses: {score_state.misses}",
+                    end="",
+                    flush=True,
+                )
             last_print_time[0] = now
 
     # open audio input stream
@@ -290,7 +448,7 @@ def main(argv=None):
 
     if args.listen:
         try:
-            listen_for_frequency(args.input_device)
+            listen_for_frequency(song, args.input_device)
         except ImportError:
             print("sounddevice is not installed. Install it to use --listen.")
 

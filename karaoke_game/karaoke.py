@@ -24,6 +24,31 @@ SONG_LOOKBACK_SECONDS = 3.0
 SONG_LOOKAHEAD_SECONDS = 5.0
 
 
+class Clock:
+    def __init__(self):
+        self.start_time = None
+        self.finished = False
+
+    def start_realtime(self):
+        self.start_time = time.time()
+
+    def start_midi_play(self, midi_path):
+        def runner():
+            self.start_time = time.time()
+            for _ in mido.MidiFile(midi_path).play():
+                # iterate in real time; we don't output MIDI by default
+                pass
+            self.finished = True
+
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
+
+    def now(self):
+        if self.start_time is None:
+            return 0.0
+        return time.time() - self.start_time
+
+
 class NoteEvent:
     def __init__(self, note, frequency_hz, start_time, end_time, velocity):
         self.note = note
@@ -249,11 +274,11 @@ class ScoreState:
 
 
 class GameState:
-    def __init__(self, song):
+    def __init__(self, song, clock):
         self.song = song
+        self.clock = clock
         self.score_state = ScoreState()
         self.pitch_tracker = PitchTracker()
-        self.start_time = time.time()
         self.lock = threading.Lock()
         self.latest_frequency = 0.0
         self.latest_rms = 0.0
@@ -264,8 +289,7 @@ class GameState:
 
     def update_from_audio(self, frequency_hz, rms):
         stable_frequency, confidence = self.pitch_tracker.update(frequency_hz)
-        now = time.time()
-        elapsed = now - self.start_time
+        elapsed = self.clock.now()
         active_note, upcoming_note = find_notes_for_time(self.song, elapsed)
 
         with self.lock:
@@ -341,12 +365,18 @@ def time_to_x_position(song, seconds_from_start, track_left, track_width):
     return track_left + (ratio * track_width)
 
 
-def run_game(song, input_device=None):
+def run_game(song, input_device=None, play_midi=False):
     import sounddevice as sd
     import pyglet
 
     selected_device = choose_input_device(input_device)
-    game_state = GameState(song)
+    clock = Clock()
+    if play_midi:
+        clock.start_midi_play(song.source_path)
+    else:
+        clock.start_realtime()
+
+    game_state = GameState(song, clock)
 
     window = pyglet.window.Window(
         width=GAME_WINDOW_WIDTH,
@@ -404,7 +434,7 @@ def run_game(song, input_device=None):
         timeline.width = 2
         timeline.draw()
 
-        elapsed = time.time() - game_state.start_time
+        elapsed = clock.now()
         left_time = elapsed - SONG_LOOKBACK_SECONDS
         right_time = elapsed + SONG_LOOKAHEAD_SECONDS
         visible_span = right_time - left_time
@@ -555,15 +585,17 @@ def choose_input_device(default_device=None):
     return selected_device
 
 
-def listen_for_frequency(song, input_device=None):
+def listen_for_frequency(song, clock=None, input_device=None):
     import sounddevice as sd
+
+    if clock is None:
+        clock = Clock()
+        clock.start_realtime()
 
     selected_device = choose_input_device(input_device)
     last_print_time = [0.0]
-    pitch_tracker = PitchTracker()
-    score_state = ScoreState()
-    start_time = time.time()
-    last_seen_target_note = [None]
+
+    game_state = GameState(song, clock)
 
     # audio callback to save data
     def audio_callback(indata, frames, time_info, status):
@@ -572,50 +604,35 @@ def listen_for_frequency(song, input_device=None):
 
         data = indata[:, 0]  # mono
         freq, rms = detect_major_frequency(data)
-        stable_freq, confidence = pitch_tracker.update(freq)
+        game_state.update_from_audio(freq, rms)
 
-        now = time.time()
-        elapsed = now - start_time
-        active_note, upcoming_note = find_notes_for_time(song, elapsed)
-
-        if active_note is not None:
-            score_state.reset_note_state(active_note.note)
-
-            if last_seen_target_note[0] != active_note.note:
-                last_seen_target_note[0] = active_note.note
-
-            if stable_freq > 0.0:
-                cents_off = cents_difference(stable_freq, active_note.frequency_hz)
-                score_state.award_hit(active_note, stable_freq, cents_off, confidence)
-
-            if elapsed >= active_note.end_time and score_state.scored_note != active_note.note:
-                score_state.mark_miss(active_note)
+        snapshot = game_state.snapshot()
+        now = clock.now()
 
         if now - last_print_time[0] >= 0.1:
-            display_note = active_note
+            display_note = snapshot["active_note"]
             if display_note is None:
-                display_note = upcoming_note
+                display_note = snapshot["upcoming_note"]
 
             if display_note is None:
                 target_text = "Target: ---"
             else:
                 target_text = f"Target: {note_name(display_note.note)} {display_note.frequency_hz:7.2f} Hz"
 
-            if stable_freq > 0.0 and active_note is not None:
-                cents_off = 0.0
-                cents_off = cents_difference(stable_freq, active_note.frequency_hz)
+            if snapshot["frequency"] > 0.0 and snapshot["active_note"] is not None:
+                cents_off = cents_difference(snapshot["frequency"], snapshot["active_note"].frequency_hz)
                 print(
-                    f"\rDetected frequency: {stable_freq:7.2f} Hz  "
-                    f"RMS: {rms:0.4f}  Confidence: {confidence:0.2f}  "
-                    f"{target_text}  Score: {score_state.score}  Combo: {score_state.combo}  "
-                    f"Hits: {score_state.hits}  Misses: {score_state.misses}  Cents: {cents_off:0.1f}",
+                    f"\rDetected frequency: {snapshot['frequency']:7.2f} Hz  "
+                    f"RMS: {snapshot['rms']:0.4f}  Confidence: {snapshot['confidence']:0.2f}  "
+                    f"{target_text}  Score: {snapshot['score']}  Combo: {snapshot['combo']}  "
+                    f"Hits: {snapshot['hits']}  Misses: {snapshot['misses']}  Cents: {cents_off:0.1f}",
                     end="",
                     flush=True,
                 )
             else:
                 print(
                     f"\rDetected frequency:   ---    Hz  RMS too low  {target_text}  "
-                    f"Score: {score_state.score}  Combo: {score_state.combo}  Hits: {score_state.hits}  Misses: {score_state.misses}",
+                    f"Score: {snapshot['score']}  Combo: {snapshot['combo']}  Hits: {snapshot['hits']}  Misses: {snapshot['misses']}",
                     end="",
                     flush=True,
                 )
@@ -661,6 +678,11 @@ def build_argument_parser():
         help="Start the pyglet karaoke window",
     )
     parser.add_argument(
+        "--play-midi",
+        action="store_true",
+        help="Drive the game clock from the MIDI file playback",
+    )
+    parser.add_argument(
         "--input-device",
         type=int,
         default=None,
@@ -691,14 +713,18 @@ def main(argv=None):
 
     if args.game:
         try:
-            run_game(song, args.input_device)
+            run_game(song, args.input_device, play_midi=args.play_midi)
         except ImportError:
             print("sounddevice or pyglet is not installed. Install both to use --game.")
             return 1
 
     if args.listen:
         try:
-            listen_for_frequency(song, args.input_device)
+            clock = None
+            if args.play_midi:
+                clock = Clock()
+                clock.start_midi_play(song.source_path)
+            listen_for_frequency(song, clock=clock, input_device=args.input_device)
         except ImportError:
             print("sounddevice is not installed. Install it to use --listen.")
 

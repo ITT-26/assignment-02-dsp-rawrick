@@ -1,6 +1,7 @@
 import argparse
 import math
 import time
+import threading
 
 import mido
 import numpy as np
@@ -17,6 +18,10 @@ PITCH_HISTORY_SIZE = 5
 PITCH_STABLE_SPREAD = 25.0
 NOTE_HIT_CENTS = 50.0
 NOTE_POINTS = 100
+GAME_WINDOW_WIDTH = 1100
+GAME_WINDOW_HEIGHT = 720
+SONG_LOOKBACK_SECONDS = 3.0
+SONG_LOOKAHEAD_SECONDS = 5.0
 
 
 class NoteEvent:
@@ -243,6 +248,62 @@ class ScoreState:
         return True
 
 
+class GameState:
+    def __init__(self, song):
+        self.song = song
+        self.score_state = ScoreState()
+        self.pitch_tracker = PitchTracker()
+        self.start_time = time.time()
+        self.lock = threading.Lock()
+        self.latest_frequency = 0.0
+        self.latest_rms = 0.0
+        self.latest_confidence = 0.0
+        self.active_note = None
+        self.upcoming_note = None
+        self.finished = False
+
+    def update_from_audio(self, frequency_hz, rms):
+        stable_frequency, confidence = self.pitch_tracker.update(frequency_hz)
+        now = time.time()
+        elapsed = now - self.start_time
+        active_note, upcoming_note = find_notes_for_time(self.song, elapsed)
+
+        with self.lock:
+            self.latest_frequency = stable_frequency
+            self.latest_rms = rms
+            self.latest_confidence = confidence
+            self.active_note = active_note
+            self.upcoming_note = upcoming_note
+
+            if active_note is not None:
+                self.score_state.reset_note_state(active_note.note)
+
+                if stable_frequency > 0.0:
+                    cents_off = cents_difference(stable_frequency, active_note.frequency_hz)
+                    self.score_state.award_hit(active_note, stable_frequency, cents_off, confidence)
+
+                if elapsed >= active_note.end_time and self.score_state.scored_note != active_note.note:
+                    self.score_state.mark_miss(active_note)
+
+            if elapsed >= self.song.duration() and active_note is None and upcoming_note is None:
+                self.finished = True
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "score": self.score_state.score,
+                "hits": self.score_state.hits,
+                "misses": self.score_state.misses,
+                "combo": self.score_state.combo,
+                "frequency": self.latest_frequency,
+                "rms": self.latest_rms,
+                "confidence": self.latest_confidence,
+                "active_note": self.active_note,
+                "upcoming_note": self.upcoming_note,
+                "finished": self.finished,
+            }
+
+
 def find_notes_for_time(song, elapsed_seconds):
     active_note = None
     upcoming_note = None
@@ -254,6 +315,183 @@ def find_notes_for_time(song, elapsed_seconds):
             upcoming_note = event
             break
     return active_note, upcoming_note
+
+
+def note_to_y_position(note_number, lane_bottom, lane_height):
+    min_note = 48
+    max_note = 84
+    if note_number < min_note:
+        note_number = min_note
+    if note_number > max_note:
+        note_number = max_note
+
+    note_range = max_note - min_note
+    if note_range <= 0:
+        return lane_bottom + lane_height / 2.0
+
+    ratio = (note_number - min_note) / note_range
+    return lane_bottom + (ratio * lane_height)
+
+
+def time_to_x_position(song, seconds_from_start, track_left, track_width):
+    song_duration = song.duration()
+    if song_duration <= 0.0:
+        return track_left
+    ratio = seconds_from_start / song_duration
+    return track_left + (ratio * track_width)
+
+
+def run_game(song, input_device=None):
+    import sounddevice as sd
+    import pyglet
+
+    selected_device = choose_input_device(input_device)
+    game_state = GameState(song)
+
+    window = pyglet.window.Window(
+        width=GAME_WINDOW_WIDTH,
+        height=GAME_WINDOW_HEIGHT,
+        caption="Karaoke Game",
+        resizable=True,
+    )
+
+    instruction_label = pyglet.text.Label(
+        "Sing or whistle the highlighted note",
+        x=20,
+        y=window.height - 30,
+        anchor_x="left",
+        anchor_y="center",
+        font_size=16,
+        color=(255, 255, 255, 255),
+    )
+    score_label = pyglet.text.Label("", x=20, y=window.height - 60, anchor_x="left", anchor_y="center", font_size=14, color=(255, 255, 255, 255))
+    freq_label = pyglet.text.Label("", x=20, y=window.height - 85, anchor_x="left", anchor_y="center", font_size=14, color=(255, 255, 255, 255))
+    target_label = pyglet.text.Label("", x=20, y=window.height - 110, anchor_x="left", anchor_y="center", font_size=14, color=(255, 255, 255, 255))
+    status_label = pyglet.text.Label("", x=20, y=20, anchor_x="left", anchor_y="bottom", font_size=14, color=(255, 220, 180, 255))
+
+    # audio callback to save data
+    def audio_callback(indata, frames, time_info, status):
+        if status:
+            print(status)
+
+        data = indata[:, 0]  # mono
+        freq, rms = detect_major_frequency(data)
+        game_state.update_from_audio(freq, rms)
+
+    # open audio input stream
+    stream = sd.InputStream(
+        device=selected_device,
+        channels=CHANNELS,
+        samplerate=RATE,
+        blocksize=CHUNK_SIZE,
+        callback=audio_callback,
+        latency="low",
+    )
+
+    def draw_song_track(snapshot):
+        track_left = 180
+        track_right = window.width - 40
+        track_bottom = 120
+        track_top = window.height - 160
+        track_width = track_right - track_left
+        track_height = track_top - track_bottom
+
+        background = pyglet.shapes.Rectangle(track_left, track_bottom, track_width, track_height, color=(30, 30, 45))
+        background.opacity = 220
+        background.draw()
+
+        timeline = pyglet.shapes.Line(track_left, track_bottom + 10, track_right, track_bottom + 10, color=(80, 80, 120))
+        timeline.width = 2
+        timeline.draw()
+
+        elapsed = time.time() - game_state.start_time
+        left_time = elapsed - SONG_LOOKBACK_SECONDS
+        right_time = elapsed + SONG_LOOKAHEAD_SECONDS
+        visible_span = right_time - left_time
+
+        for event in song.note_events:
+            if event.end_time < left_time:
+                continue
+            if event.start_time > right_time:
+                continue
+
+            start_ratio = (event.start_time - left_time) / visible_span
+            end_ratio = (event.end_time - left_time) / visible_span
+            x1 = track_left + (start_ratio * track_width)
+            x2 = track_left + (end_ratio * track_width)
+            if x2 < x1:
+                x2 = x1 + 2
+
+            y = note_to_y_position(event.note, track_bottom + 20, track_height - 40)
+            block_height = 18
+
+            if snapshot["active_note"] is not None and event.note == snapshot["active_note"].note:
+                color = (80, 200, 120)
+            elif snapshot["upcoming_note"] is not None and event.note == snapshot["upcoming_note"].note:
+                color = (220, 180, 80)
+            else:
+                color = (110, 130, 170)
+
+            note_block = pyglet.shapes.Rectangle(x1, y - block_height / 2.0, x2 - x1, block_height, color=color)
+            note_block.opacity = 210
+            note_block.draw()
+
+        cursor_x = time_to_x_position(song, elapsed, track_left, track_width)
+        cursor = pyglet.shapes.Line(cursor_x, track_bottom, cursor_x, track_top, color=(240, 240, 255))
+        cursor.width = 3
+        cursor.draw()
+
+    def update_labels(snapshot):
+        active_note = snapshot["active_note"]
+        upcoming_note = snapshot["upcoming_note"]
+
+        score_label.text = f"Score: {snapshot['score']}   Combo: {snapshot['combo']}   Hits: {snapshot['hits']}   Misses: {snapshot['misses']}"
+        if snapshot["frequency"] > 0.0:
+            freq_label.text = f"Detected: {snapshot['frequency']:.2f} Hz   RMS: {snapshot['rms']:.4f}   Confidence: {snapshot['confidence']:.2f}"
+        else:
+            freq_label.text = f"Detected: ---   RMS: {snapshot['rms']:.4f}"
+
+        if active_note is not None:
+            target_label.text = f"Target: {note_name(active_note.note)}   {active_note.frequency_hz:.2f} Hz"
+        elif upcoming_note is not None:
+            target_label.text = f"Next: {note_name(upcoming_note.note)}   {upcoming_note.frequency_hz:.2f} Hz"
+        else:
+            target_label.text = "Target: ---"
+
+        if snapshot["finished"]:
+            status_label.text = "Song finished"
+        else:
+            status_label.text = ""
+
+    @window.event
+    def on_draw():
+        window.clear()
+        pyglet.gl.glClearColor(0.07, 0.07, 0.12, 1.0)
+
+        snapshot = game_state.snapshot()
+        instruction_label.y = window.height - 30
+        score_label.y = window.height - 60
+        freq_label.y = window.height - 85
+        target_label.y = window.height - 110
+        update_labels(snapshot)
+        draw_song_track(snapshot)
+
+        instruction_label.draw()
+        score_label.draw()
+        freq_label.draw()
+        target_label.draw()
+        status_label.draw()
+
+    def update(dt):
+        if game_state.snapshot()["finished"]:
+            pyglet.app.exit()
+
+    pyglet.clock.schedule_interval(update, 1.0 / 60.0)
+
+    with stream:
+        print("Starting karaoke game...")
+        print("Close the window or press Ctrl+C to stop.")
+        pyglet.app.run()
 
 
 def detect_major_frequency(data):
@@ -418,6 +656,11 @@ def build_argument_parser():
         help="Start live microphone frequency detection after loading the MIDI file",
     )
     parser.add_argument(
+        "--game",
+        action="store_true",
+        help="Start the pyglet karaoke window",
+    )
+    parser.add_argument(
         "--input-device",
         type=int,
         default=None,
@@ -445,6 +688,13 @@ def main(argv=None):
     for i in range(min(limit, len(song.note_events))):
         event = song.note_events[i]
         print(format_note_event(event))
+
+    if args.game:
+        try:
+            run_game(song, args.input_device)
+        except ImportError:
+            print("sounddevice or pyglet is not installed. Install both to use --game.")
+            return 1
 
     if args.listen:
         try:

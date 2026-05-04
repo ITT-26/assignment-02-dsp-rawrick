@@ -695,7 +695,15 @@ def main(argv=None):
     parser = build_argument_parser()
     args = parser.parse_args(argv)
 
-    song = load_song(args.midi_file)
+    # Step 7: Robust error handling for MIDI file loading
+    try:
+        song = load_song(args.midi_file)
+    except FileNotFoundError:
+        print(f"Error: MIDI file not found: {args.midi_file}")
+        return 1
+    except Exception as e:
+        print(f"Error loading MIDI file: {e}")
+        return 1
 
     print(f"Midi File: {song.source_path}")
     print(f"Ticks per beat: {song.ticks_per_beat}")
@@ -703,6 +711,7 @@ def main(argv=None):
     song_duration = song.duration()
     print(f"Duration: {song_duration:.3f}s")
 
+    # Print first N events
     limit = args.limit
     if limit < 0:
         limit = 0
@@ -711,13 +720,18 @@ def main(argv=None):
         event = song.note_events[i]
         print(format_note_event(event))
 
+    # Start game mode if requested
     if args.game:
         try:
             run_game(song, args.input_device, play_midi=args.play_midi)
         except ImportError:
-            print("sounddevice or pyglet is not installed. Install both to use --game.")
+            print("Error: sounddevice or pyglet not installed. Install both for --game mode.")
+            return 1
+        except Exception as e:
+            print(f"Error running game: {e}")
             return 1
 
+    # Start listen mode if requested
     if args.listen:
         try:
             clock = None
@@ -726,7 +740,11 @@ def main(argv=None):
                 clock.start_midi_play(song.source_path)
             listen_for_frequency(song, clock=clock, input_device=args.input_device)
         except ImportError:
-            print("sounddevice is not installed. Install it to use --listen.")
+            print("Error: sounddevice not installed. Install it for --listen mode.")
+            return 1
+        except Exception as e:
+            print(f"Error in listen mode: {e}")
+            return 1
 
     return 0
 

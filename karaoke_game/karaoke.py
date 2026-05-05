@@ -6,6 +6,7 @@ from game import run_game
 from midi_loader import load_song
 
 
+# CLI entrypoint: choose MIDI file and input device, then launch the game
 def main():
     base_dir = os.path.join('read_midi')
     if len(sys.argv) < 2:

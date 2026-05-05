@@ -17,6 +17,7 @@ PITCH_SPREAD = 25.0
 
 
 def cents(actual, target):
+    # convert frequency ratio to cents difference
     return 0.0 if actual <= 0 or target <= 0 else 1200.0 * math.log(actual / target, 2.0)
 
 
@@ -24,6 +25,7 @@ class PitchTracker:
     def __init__(self):
         self.history = []
 
+    # update history and return median frequency and confidence
     def update(self, frequency):
         if frequency > 0:
             self.history.append(frequency)
@@ -39,6 +41,7 @@ class PitchTracker:
 
 
 def detect_major_frequency(data):
+    # detect the dominant frequency in the buffer and return (freq, rms)
     rms = math.sqrt(np.mean(data * data))
     if rms < MIN_RMS:
         return 0.0, rms
@@ -52,6 +55,7 @@ def detect_major_frequency(data):
 
 
 def choose_input_device(default=None):
+    # prompt user to choose an input device (or return provided default)
     if default is not None:
         return default
     devices = sd.query_devices()
@@ -66,6 +70,7 @@ def choose_input_device(default=None):
 
 
 def listen_for_frequency(song, clock=None, input_device=None):
+    # open the input stream and continuously detect frequency + score notes
     clock = clock or Clock()
     if clock.t0 is None:
         clock.start_realtime()
@@ -74,6 +79,7 @@ def listen_for_frequency(song, clock=None, input_device=None):
     last_print = [0.0]
     device = choose_input_device(input_device)
 
+    # input stream callback: analyze buffer, update tracker and scoring
     def callback(indata, frames, time_info, status):
         if status:
             print(status)

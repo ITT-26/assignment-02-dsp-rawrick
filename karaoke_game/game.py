@@ -9,6 +9,7 @@ from audio import PitchTracker, cents, detect_major_frequency, CHANNELS, CHUNK_S
 from helper import Clock, ScoreState
 
 def run_game(song, input_device=None, play_midi=False):
+    # main game loop and rendering
     clock = Clock()
 
     tracker = PitchTracker()
@@ -32,6 +33,7 @@ def run_game(song, input_device=None, play_midi=False):
         active = next((event for event in song.note_events if event.start_time <= now < event.end_time), None)
         if active and state['freq'] > 0 and scores.award(active, cents(state['freq'], active.frequency_hz)):
             state['score'] = scores.score
+    # audio callback: update pitch tracker and award points when appropriate
 
     try:
         window = pyglet.window.Window(900, 420, caption='Karaoke Game', resizable=True)
@@ -52,6 +54,7 @@ def run_game(song, input_device=None, play_midi=False):
                 clock.start_midi_play(song.source_path)
             else:
                 clock.start_realtime()
+        # start the clock and optionally play MIDI
 
         def reset_round():
             nonlocal started, finished, launch_at, scores, state
@@ -61,8 +64,10 @@ def run_game(song, input_device=None, play_midi=False):
             scores = ScoreState()
             state = {'freq': 0.0, 'rms': 0.0, 'score': 0}
             clock.t0 = None
+        # reset game state for a new round
 
         def mark_misses(now):
+            # mark note events that have finished as misses if not scored
             for event in song.note_events:
                 if event.end_time <= now:
                     scores.miss(event)
@@ -70,6 +75,7 @@ def run_game(song, input_device=None, play_midi=False):
         def accuracy_percent():
             total = scores.hits + scores.misses
             return 0.0 if total <= 0 else (scores.hits / total) * 100.0
+        # compute hit accuracy as percentage
 
         @window.event
         def on_key_press(symbol, modifiers):
@@ -77,6 +83,7 @@ def run_game(song, input_device=None, play_midi=False):
                 pyglet.app.exit()
             elif symbol == pyglet.window.key.SPACE:
                 reset_round()
+        # handle basic keyboard commands
 
         @window.event
         def on_draw():
@@ -149,6 +156,7 @@ def run_game(song, input_device=None, play_midi=False):
         def tick(dt):
             if not started and (time.time() - launch_at) >= countdown_seconds:
                 ensure_started()
+        # scheduled tick to manage countdown and starting the game
 
         with stream:
             pyglet.clock.schedule_interval(tick, 1 / 30.0)

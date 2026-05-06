@@ -41,17 +41,52 @@ class PitchTracker:
 
 
 def detect_major_frequency(data):
-    # detect the dominant frequency in the buffer and return (freq, rms)
+    # detect the dominant frequency with a clipped autocorrelation search
     rms = math.sqrt(np.mean(data * data))
     if rms < MIN_RMS:
         return 0.0, rms
-    window = np.hanning(len(data))
-    spectrum = np.abs(np.fft.rfft(data * window))
-    freqs = np.fft.rfftfreq(len(data), 1.0 / RATE)
-    mask = (freqs >= MIN_FREQ) & (freqs <= MAX_FREQ)
-    if not np.any(mask):
+
+    signal = np.asarray(data, dtype=np.float32)
+    signal = signal - np.mean(signal)
+    signal = signal * np.hanning(len(signal))
+    peak = np.max(np.abs(signal))
+    if peak <= 1e-8:
         return 0.0, rms
-    return float(freqs[mask][np.argmax(spectrum[mask])]), rms
+
+    # remove low-energy detail so harmonics do not dominate the correlation peak
+    clipped = np.where(np.abs(signal) >= 0.3 * peak, signal, 0.0)
+    if not np.any(clipped):
+        clipped = signal
+
+    corr = np.correlate(clipped, clipped, mode='full')[len(clipped) - 1:]
+    corr[0] = 0.0
+    if corr[0] == 0.0:
+        corr = corr / (np.max(corr) + 1e-8)
+
+    min_lag = max(1, int(RATE / MAX_FREQ))
+    max_lag = min(len(corr) - 1, int(RATE / MIN_FREQ))
+    if min_lag >= max_lag:
+        return 0.0, rms
+
+    window = corr[min_lag:max_lag + 1]
+    if window.size == 0:
+        return 0.0, rms
+
+    local_maxima = []
+    for offset in range(1, len(window) - 1):
+        if window[offset] >= window[offset - 1] and window[offset] >= window[offset + 1]:
+            local_maxima.append(offset)
+
+    if local_maxima:
+        best_offset = max(local_maxima, key=lambda idx: window[idx])
+    else:
+        best_offset = int(np.argmax(window))
+
+    lag = min_lag + best_offset
+    if corr[lag] < 0.2:
+        return 0.0, rms
+
+    return float(RATE / lag), rms
 
 
 def choose_input_device(default=None):

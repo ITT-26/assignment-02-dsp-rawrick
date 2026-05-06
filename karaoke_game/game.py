@@ -31,8 +31,8 @@ def run_game(song, input_device=None, play_midi=False):
             return
         now = clock.now()
         active = next((event for event in song.note_events if event.start_time <= now < event.end_time), None)
-        if active and state['freq'] > 0 and scores.award(active, cents(state['freq'], active.frequency_hz)):
-            state['score'] = scores.score
+        if active and state['freq'] > 0:
+            scores.track_pitch(active, cents(state['freq'], active.frequency_hz))
     # audio callback: update pitch tracker and award points when appropriate
 
     try:
@@ -66,11 +66,12 @@ def run_game(song, input_device=None, play_midi=False):
             clock.t0 = None
         # reset game state for a new round
 
-        def mark_misses(now):
-            # mark note events that have finished as misses if not scored
+        def finalize_finished_notes(now):
+            # finalize ended notes once, based on best pitch seen during note lifetime
             for event in song.note_events:
                 if event.end_time <= now:
-                    scores.miss(event)
+                    scores.finalize(event)
+            state['score'] = scores.score
 
         def accuracy_percent():
             total = scores.hits + scores.misses
@@ -138,7 +139,7 @@ def run_game(song, input_device=None, play_midi=False):
                 countdown_label.text = ''
 
             if started and not finished:
-                mark_misses(clock.now())
+                finalize_finished_notes(clock.now())
                 if clock.now() >= song.duration():
                     finished = True
 

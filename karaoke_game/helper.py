@@ -4,7 +4,9 @@ import time
 import mido
 
 
-NOTE_HIT_CENTS = 100.0
+NOTE_HIT_CENTS = 130.0
+NOTE_GREAT_CENTS = 70.0
+NOTE_PERFECT_CENTS = 30.0
 
 
 # tracks game time
@@ -36,20 +38,64 @@ class ScoreState:
         self.score = 0
         self.hits = 0
         self.misses = 0
-        self.scored = set()
+        self.combo = 0
+        self.max_combo = 0
+        self.resolved = set()
+        self.best_error = {}
+
+    # stable unique key for one note event
+    def key(self, event):
+        return (event.start_time, event.end_time, event.note)
+
+    # remember best pitch error seen while note is active
+    def track_pitch(self, event, cents_off):
+        if event is None:
+            return False
+        note_key = self.key(event)
+        if note_key in self.resolved:
+            return False
+        value = abs(cents_off)
+        best = self.best_error.get(note_key)
+        if best is None or value < best:
+            self.best_error[note_key] = value
+            return True
+        return False
+
+    # finalize one note after it ends and update score/accuracy once
+    def finalize(self, event):
+        if event is None:
+            return False
+        note_key = self.key(event)
+        if note_key in self.resolved:
+            return False
+        self.resolved.add(note_key)
+        best = self.best_error.pop(note_key, None)
+        if best is None or best > NOTE_HIT_CENTS:
+            self.misses += 1
+            self.combo = 0
+            return True
+
+        self.hits += 1
+        self.combo += 1
+        self.max_combo = max(self.max_combo, self.combo)
+
+        # base points + quality + combo bonus
+        quality_bonus = 10
+        if best <= NOTE_PERFECT_CENTS:
+            quality_bonus = 50
+        elif best <= NOTE_GREAT_CENTS:
+            quality_bonus = 30
+        combo_bonus = min(50, max(0, self.combo - 1) * 5)
+        self.score += 100 + quality_bonus + combo_bonus
+        return True
 
     # true on hit, false on miss/already scored
     def award(self, event, cents_off):
-        if event is None or event.note in self.scored or abs(cents_off) > NOTE_HIT_CENTS:
+        if event is None:
             return False
-        self.score += 100
-        self.hits += 1
-        self.scored.add(event.note)
-        return True
+        self.track_pitch(event, cents_off)
+        return self.finalize(event)
 
     # true on miss, false on hit/already scored
     def miss(self, event):
-        if event is None or event.note in self.scored:
-            return False
-        self.misses += 1
-        return True
+        return self.finalize(event)
